@@ -22,8 +22,9 @@ mr = MR(pd, resource_size,
 
 # --- 实验观察点 ---
 print(f"MR 注册成功！")
-# 在 Pyverbs 中，地址属性通常叫 addr
-# print(f"虚拟地址 (Addr): {hex(mr.addr)}")
+
+# lkey给本地看，匹配才能提交WQE
 print(f"本地钥匙 (L_Key): {hex(mr.lkey)}")
+# rkey给远端网卡看，匹配就可以写入内存
 print(f"远程钥匙 (R_Key): {hex(mr.rkey)}")
 print(f"内存长度 (Length): {mr.length} 字节")
