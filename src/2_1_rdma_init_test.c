@@ -3,6 +3,30 @@
 #include <string.h>
 #include <infiniband/verbs.h> // 必须包含这个头文件
 
+static void cleanup_rdma_resources(struct ibv_device **dev_list,
+                                   struct ibv_context *ctx,
+                                   struct ibv_pd *pd,
+                                   struct ibv_cq *cq,
+                                   struct ibv_qp *qp,
+                                   struct ibv_mr *mr,
+                                   char *buf)
+{
+    if (mr)
+        ibv_dereg_mr(mr);
+    if (buf)
+        free(buf);
+    if (qp)
+        ibv_destroy_qp(qp);
+    if (cq)
+        ibv_destroy_cq(cq);
+    if (pd)
+        ibv_dealloc_pd(pd);
+    if (ctx)
+        ibv_close_device(ctx);
+    if (dev_list)
+        ibv_free_device_list(dev_list);
+}
+
 int modify_qp_to_rts(struct ibv_qp *qp)
 {
     struct ibv_qp_attr attr;
@@ -132,6 +156,28 @@ int main()
     int completed = 0;
     int poll_round = 0;
 
+#define CLEANUP_AND_RETURN()                                        \
+    {                                                               \
+        cleanup_rdma_resources(dev_list, ctx, pd, cq, qp, mr, buf); \
+        return 1;                                                   \
+    }
+
+#define FAIL_AND_RETURN(err_msg)          \
+    {                                     \
+        fprintf(stderr, "%s\n", err_msg); \
+        CLEANUP_AND_RETURN();             \
+    }
+
+    dev_list = NULL;
+    ctx = NULL;
+    pd = NULL;
+    cq = NULL;
+    qp = NULL;
+    mr = NULL;
+    buf = NULL;
+    send_buf = NULL;
+    recv_buf = NULL;
+
     // 1. 找网卡 (Get Device List)
     // 这一步之后，驱动程序会在内核里为你这个进程创建一个 Context。
     // 通过这个 Context，你的程序获得了直接访问网卡硬件寄存器的“通行证”。
@@ -141,13 +187,18 @@ int main()
         perror("获取 IB 设备列表失败");
         return 1;
     }
+    if (!dev_list[0])
+    {
+        fprintf(stderr, "未找到可用 IB 设备\n");
+        CLEANUP_AND_RETURN();
+    }
 
     // 2. 开网卡 (Open Device) - 假设用列表里的第一个
     ctx = ibv_open_device(dev_list[0]);
     if (!ctx)
     {
         fprintf(stderr, "打开设备失败: %s\n", ibv_get_device_name(dev_list[0]));
-        return 1;
+        CLEANUP_AND_RETURN();
     }
     printf("成功打开网卡: %s\n", ibv_get_device_name(dev_list[0]));
 
@@ -157,16 +208,14 @@ int main()
     pd = ibv_alloc_pd(ctx);
     if (!pd)
     {
-        fprintf(stderr, "分配 PD 失败\n");
-        return 1;
+        FAIL_AND_RETURN("分配 PD 失败");
     }
 
     // 4. 创建 CQ (Create CQ) - 你的收件箱，深度设为 100
     cq = ibv_create_cq(ctx, 100, NULL, NULL, 0);
     if (!cq)
     {
-        fprintf(stderr, "创建 CQ 失败\n");
-        return 1;
+        FAIL_AND_RETURN("创建 CQ 失败");
     }
 
     // 5. 创建 QP (Create QP) - 雇佣搬运工
@@ -184,8 +233,7 @@ int main()
     qp = ibv_create_qp(pd, &qp_init_attr);
     if (!qp)
     {
-        fprintf(stderr, "创建 QP 失败\n");
-        return 1;
+        FAIL_AND_RETURN("创建 QP 失败");
     }
 
     printf("恭喜！所有 RDMA 静态资源已就绪。\n");
@@ -195,13 +243,7 @@ int main()
     // 你的实验目标是 Loopback，所以这里会把目的 QPN/GID 配成自己。
     if (modify_qp_to_rts(qp))
     {
-        fprintf(stderr, "将 QP 激活到 RTS 失败\n");
-        ibv_destroy_qp(qp);
-        ibv_destroy_cq(cq);
-        ibv_dealloc_pd(pd);
-        ibv_close_device(ctx);
-        ibv_free_device_list(dev_list);
-        return 1;
+        FAIL_AND_RETURN("将 QP 激活到 RTS 失败");
     }
     printf("QP 状态已切换到 RTS（Loopback 配置）\n");
 
@@ -210,13 +252,7 @@ int main()
     buf = calloc(1, buf_size);
     if (!buf)
     {
-        fprintf(stderr, "分配缓冲区失败\n");
-        ibv_destroy_qp(qp);
-        ibv_destroy_cq(cq);
-        ibv_dealloc_pd(pd);
-        ibv_close_device(ctx);
-        ibv_free_device_list(dev_list);
-        return 1;
+        FAIL_AND_RETURN("分配缓冲区失败");
     }
 
     // 一个 MR 里切两段：前半段当发送缓冲区，后半段当接收缓冲区。
@@ -224,14 +260,7 @@ int main()
     recv_buf = buf + 2048;
     if (msg_len > 2048)
     {
-        fprintf(stderr, "消息过大，超过示例缓冲区分段大小\n");
-        free(buf);
-        ibv_destroy_qp(qp);
-        ibv_destroy_cq(cq);
-        ibv_dealloc_pd(pd);
-        ibv_close_device(ctx);
-        ibv_free_device_list(dev_list);
-        return 1;
+        FAIL_AND_RETURN("消息过大，超过示例缓冲区分段大小");
     }
     memcpy(send_buf, msg, msg_len);
 
@@ -240,14 +269,7 @@ int main()
                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
     if (!mr)
     {
-        fprintf(stderr, "注册 MR 失败\n");
-        free(buf);
-        ibv_destroy_qp(qp);
-        ibv_destroy_cq(cq);
-        ibv_dealloc_pd(pd);
-        ibv_close_device(ctx);
-        ibv_free_device_list(dev_list);
-        return 1;
+        FAIL_AND_RETURN("注册 MR 失败");
     }
 
     // 7. 先 post 一个接收 WR 到 RQ（非常关键）
@@ -264,15 +286,7 @@ int main()
 
     if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr))
     {
-        fprintf(stderr, "投递 RECV WR 失败\n");
-        ibv_dereg_mr(mr);
-        free(buf);
-        ibv_destroy_qp(qp);
-        ibv_destroy_cq(cq);
-        ibv_dealloc_pd(pd);
-        ibv_close_device(ctx);
-        ibv_free_device_list(dev_list);
-        return 1;
+        FAIL_AND_RETURN("投递 RECV WR 失败");
     }
 
     // 8. 再 post 一个 SEND WR 到 SQ，发往“自己”
@@ -290,15 +304,7 @@ int main()
 
     if (ibv_post_send(qp, &send_wr, &bad_send_wr))
     {
-        fprintf(stderr, "投递 SEND WR 失败\n");
-        ibv_dereg_mr(mr);
-        free(buf);
-        ibv_destroy_qp(qp);
-        ibv_destroy_cq(cq);
-        ibv_dealloc_pd(pd);
-        ibv_close_device(ctx);
-        ibv_free_device_list(dev_list);
-        return 1;
+        FAIL_AND_RETURN("投递 SEND WR 失败");
     }
 
     // 9. 轮询 CQ，等待 2 个完成事件（一个 RECV，一个 SEND）
@@ -311,15 +317,7 @@ int main()
         n = ibv_poll_cq(cq, 2 - completed, &wc[completed]);
         if (n < 0)
         {
-            fprintf(stderr, "ibv_poll_cq 调用失败\n");
-            ibv_dereg_mr(mr);
-            free(buf);
-            ibv_destroy_qp(qp);
-            ibv_destroy_cq(cq);
-            ibv_dealloc_pd(pd);
-            ibv_close_device(ctx);
-            ibv_free_device_list(dev_list);
-            return 1;
+            FAIL_AND_RETURN("ibv_poll_cq 调用失败");
         }
 
         completed += n;
@@ -327,14 +325,7 @@ int main()
         if (poll_round > 1000000)
         {
             fprintf(stderr, "等待 CQE 超时，当前完成数 %d/2\n", completed);
-            ibv_dereg_mr(mr);
-            free(buf);
-            ibv_destroy_qp(qp);
-            ibv_destroy_cq(cq);
-            ibv_dealloc_pd(pd);
-            ibv_close_device(ctx);
-            ibv_free_device_list(dev_list);
-            return 1;
+            CLEANUP_AND_RETURN();
         }
 
         for (i = 0; i < completed; i++)
@@ -343,14 +334,7 @@ int main()
             {
                 fprintf(stderr, "CQE[%d] 异常, status=%d, wr_id=%llu\n",
                         i, wc[i].status, (unsigned long long)wc[i].wr_id);
-                ibv_dereg_mr(mr);
-                free(buf);
-                ibv_destroy_qp(qp);
-                ibv_destroy_cq(cq);
-                ibv_dealloc_pd(pd);
-                ibv_close_device(ctx);
-                ibv_free_device_list(dev_list);
-                return 1;
+                CLEANUP_AND_RETURN();
             }
         }
     }
@@ -358,16 +342,10 @@ int main()
     printf("Loopback 的 CQ 完成事件数量: %d\n", completed);
     printf("接收缓冲区内容: %s\n", recv_buf);
 
-    // 完成后先注销 MR，再释放用户态 buffer。
-    ibv_dereg_mr(mr);
-    free(buf);
+    cleanup_rdma_resources(dev_list, ctx, pd, cq, qp, mr, buf);
 
-    // 记得打扫战场
-    ibv_destroy_qp(qp);
-    ibv_destroy_cq(cq);
-    ibv_dealloc_pd(pd);
-    ibv_close_device(ctx);
-    ibv_free_device_list(dev_list);
+#undef FAIL_AND_RETURN
+#undef CLEANUP_AND_RETURN
 
     return 0;
 }
