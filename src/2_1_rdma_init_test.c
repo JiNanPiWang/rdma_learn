@@ -15,7 +15,7 @@ int modify_qp_to_rts(struct ibv_qp *qp)
     // 参数保护：避免空指针导致段错误
     if (!qp)
     {
-        fprintf(stderr, "modify_qp_to_rts: qp is NULL\n");
+        fprintf(stderr, "modify_qp_to_rts: QP 为空\n");
         return 1;
     }
 
@@ -27,7 +27,7 @@ int modify_qp_to_rts(struct ibv_qp *qp)
     ret = ibv_query_gid(qp->context, port_num, gid_index, &local_gid);
     if (ret)
     {
-        fprintf(stderr, "Failed to query GID (port=%d, gid_index=%d)\n", port_num, gid_index);
+        fprintf(stderr, "查询 GID 失败 (port=%d, gid_index=%d)\n", port_num, gid_index);
         return 1;
     }
 
@@ -49,7 +49,7 @@ int modify_qp_to_rts(struct ibv_qp *qp)
     // 真正判断标准是 ibv_modify_qp 返回值：0 成功，非 0 失败。
     if (ibv_modify_qp(qp, &attr, flags))
     {
-        fprintf(stderr, "Failed to modify QP to INIT\n");
+        fprintf(stderr, "将 QP 切换到 INIT 失败\n");
         return 1;
     }
 
@@ -81,7 +81,7 @@ int modify_qp_to_rts(struct ibv_qp *qp)
             IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
     if (ibv_modify_qp(qp, &attr, flags))
     {
-        fprintf(stderr, "Failed to modify QP to RTR\n");
+        fprintf(stderr, "将 QP 切换到 RTR 失败\n");
         return 1;
     }
 
@@ -100,7 +100,7 @@ int modify_qp_to_rts(struct ibv_qp *qp)
             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
     if (ibv_modify_qp(qp, &attr, flags))
     {
-        fprintf(stderr, "Failed to modify QP to RTS\n");
+        fprintf(stderr, "将 QP 切换到 RTS 失败\n");
         return 1;
     }
 
@@ -114,7 +114,23 @@ int main()
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     struct ibv_qp *qp;
+    struct ibv_mr *mr;
     struct ibv_qp_init_attr qp_init_attr;
+    struct ibv_sge recv_sge;
+    struct ibv_sge send_sge;
+    struct ibv_recv_wr recv_wr;
+    struct ibv_recv_wr *bad_recv_wr;
+    struct ibv_send_wr send_wr;
+    struct ibv_send_wr *bad_send_wr;
+    struct ibv_wc wc[2];
+    char *buf;
+    char *send_buf;
+    char *recv_buf;
+    const char *msg = "hello rdma loopback";
+    size_t msg_len = strlen(msg) + 1;
+    const size_t buf_size = 4096;
+    int completed = 0;
+    int poll_round = 0;
 
     // 1. 找网卡 (Get Device List)
     // 这一步之后，驱动程序会在内核里为你这个进程创建一个 Context。
@@ -122,7 +138,7 @@ int main()
     dev_list = ibv_get_device_list(NULL);
     if (!dev_list)
     {
-        perror("Failed to get IB devices list");
+        perror("获取 IB 设备列表失败");
         return 1;
     }
 
@@ -130,7 +146,7 @@ int main()
     ctx = ibv_open_device(dev_list[0]);
     if (!ctx)
     {
-        fprintf(stderr, "Couldn't open device %s\n", ibv_get_device_name(dev_list[0]));
+        fprintf(stderr, "打开设备失败: %s\n", ibv_get_device_name(dev_list[0]));
         return 1;
     }
     printf("成功打开网卡: %s\n", ibv_get_device_name(dev_list[0]));
@@ -141,7 +157,7 @@ int main()
     pd = ibv_alloc_pd(ctx);
     if (!pd)
     {
-        fprintf(stderr, "Couldn't allocate PD\n");
+        fprintf(stderr, "分配 PD 失败\n");
         return 1;
     }
 
@@ -149,7 +165,7 @@ int main()
     cq = ibv_create_cq(ctx, 100, NULL, NULL, 0);
     if (!cq)
     {
-        fprintf(stderr, "Couldn't create CQ\n");
+        fprintf(stderr, "创建 CQ 失败\n");
         return 1;
     }
 
@@ -163,22 +179,23 @@ int main()
     qp_init_attr.cap.max_send_wr = 10; // 发送队列深度
     qp_init_attr.cap.max_recv_wr = 10; // 接收队列深度
     qp_init_attr.cap.max_send_sge = 1; // 每次搬运允许碎片的个数
+    qp_init_attr.cap.max_recv_sge = 1; // 每个接收 WR 最多 1 个数据片段
 
     qp = ibv_create_qp(pd, &qp_init_attr);
     if (!qp)
     {
-        fprintf(stderr, "Couldn't create QP\n");
+        fprintf(stderr, "创建 QP 失败\n");
         return 1;
     }
 
     printf("恭喜！所有 RDMA 静态资源已就绪。\n");
-    printf("QP Number: 0x%x\n", qp->qp_num);
+    printf("QP 编号: 0x%x\n", qp->qp_num);
 
     // 把 QP 推进到 RTS，真正“激活”这条 RC 连接。
     // 你的实验目标是 Loopback，所以这里会把目的 QPN/GID 配成自己。
     if (modify_qp_to_rts(qp))
     {
-        fprintf(stderr, "Failed to bring QP to RTS\n");
+        fprintf(stderr, "将 QP 激活到 RTS 失败\n");
         ibv_destroy_qp(qp);
         ibv_destroy_cq(cq);
         ibv_dealloc_pd(pd);
@@ -186,7 +203,164 @@ int main()
         ibv_free_device_list(dev_list);
         return 1;
     }
-    printf("QP state changed to RTS (loopback config).\n");
+    printf("QP 状态已切换到 RTS（Loopback 配置）\n");
+
+    // 6. 准备一块用户态内存并注册为 MR（Memory Region）
+    // RDMA 硬件只认识“注册过”的内存地址；未注册地址不能直接 DMA。
+    buf = calloc(1, buf_size);
+    if (!buf)
+    {
+        fprintf(stderr, "分配缓冲区失败\n");
+        ibv_destroy_qp(qp);
+        ibv_destroy_cq(cq);
+        ibv_dealloc_pd(pd);
+        ibv_close_device(ctx);
+        ibv_free_device_list(dev_list);
+        return 1;
+    }
+
+    // 一个 MR 里切两段：前半段当发送缓冲区，后半段当接收缓冲区。
+    send_buf = buf;
+    recv_buf = buf + 2048;
+    if (msg_len > 2048)
+    {
+        fprintf(stderr, "消息过大，超过示例缓冲区分段大小\n");
+        free(buf);
+        ibv_destroy_qp(qp);
+        ibv_destroy_cq(cq);
+        ibv_dealloc_pd(pd);
+        ibv_close_device(ctx);
+        ibv_free_device_list(dev_list);
+        return 1;
+    }
+    memcpy(send_buf, msg, msg_len);
+
+    // 注册 MR，拿到 lkey/rkey。post_send/post_recv 时 SGE 要带 lkey。
+    mr = ibv_reg_mr(pd, buf, buf_size,
+                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+    if (!mr)
+    {
+        fprintf(stderr, "注册 MR 失败\n");
+        free(buf);
+        ibv_destroy_qp(qp);
+        ibv_destroy_cq(cq);
+        ibv_dealloc_pd(pd);
+        ibv_close_device(ctx);
+        ibv_free_device_list(dev_list);
+        return 1;
+    }
+
+    // 7. 先 post 一个接收 WR 到 RQ（非常关键）
+    // RC 模式下如果对端先发而你还没挂 recv，可能触发 RNR 重试。
+    memset(&recv_sge, 0, sizeof(recv_sge));
+    recv_sge.addr = (uintptr_t)recv_buf;
+    recv_sge.length = msg_len;
+    recv_sge.lkey = mr->lkey;
+
+    memset(&recv_wr, 0, sizeof(recv_wr));
+    recv_wr.wr_id = 1; // 完成队列里用于区分这条 WR 的用户自定义 ID
+    recv_wr.sg_list = &recv_sge;
+    recv_wr.num_sge = 1;
+
+    if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr))
+    {
+        fprintf(stderr, "投递 RECV WR 失败\n");
+        ibv_dereg_mr(mr);
+        free(buf);
+        ibv_destroy_qp(qp);
+        ibv_destroy_cq(cq);
+        ibv_dealloc_pd(pd);
+        ibv_close_device(ctx);
+        ibv_free_device_list(dev_list);
+        return 1;
+    }
+
+    // 8. 再 post 一个 SEND WR 到 SQ，发往“自己”
+    memset(&send_sge, 0, sizeof(send_sge));
+    send_sge.addr = (uintptr_t)send_buf;
+    send_sge.length = msg_len;
+    send_sge.lkey = mr->lkey;
+
+    memset(&send_wr, 0, sizeof(send_wr));
+    send_wr.wr_id = 2; // 发送 WR 的 ID
+    send_wr.sg_list = &send_sge;
+    send_wr.num_sge = 1;
+    send_wr.opcode = IBV_WR_SEND;
+    send_wr.send_flags = IBV_SEND_SIGNALED; // 要求硬件把这次 SEND 完成写入 CQ
+
+    if (ibv_post_send(qp, &send_wr, &bad_send_wr))
+    {
+        fprintf(stderr, "投递 SEND WR 失败\n");
+        ibv_dereg_mr(mr);
+        free(buf);
+        ibv_destroy_qp(qp);
+        ibv_destroy_cq(cq);
+        ibv_dealloc_pd(pd);
+        ibv_close_device(ctx);
+        ibv_free_device_list(dev_list);
+        return 1;
+    }
+
+    // 9. 轮询 CQ，等待 2 个完成事件（一个 RECV，一个 SEND）
+    // 这是最直观的教学写法：忙轮询。实际工程可用事件通知优化 CPU 占用。
+    while (completed < 2)
+    {
+        int n;
+        int i;
+
+        n = ibv_poll_cq(cq, 2 - completed, &wc[completed]);
+        if (n < 0)
+        {
+            fprintf(stderr, "ibv_poll_cq 调用失败\n");
+            ibv_dereg_mr(mr);
+            free(buf);
+            ibv_destroy_qp(qp);
+            ibv_destroy_cq(cq);
+            ibv_dealloc_pd(pd);
+            ibv_close_device(ctx);
+            ibv_free_device_list(dev_list);
+            return 1;
+        }
+
+        completed += n;
+        poll_round++;
+        if (poll_round > 1000000)
+        {
+            fprintf(stderr, "等待 CQE 超时，当前完成数 %d/2\n", completed);
+            ibv_dereg_mr(mr);
+            free(buf);
+            ibv_destroy_qp(qp);
+            ibv_destroy_cq(cq);
+            ibv_dealloc_pd(pd);
+            ibv_close_device(ctx);
+            ibv_free_device_list(dev_list);
+            return 1;
+        }
+
+        for (i = 0; i < completed; i++)
+        {
+            if (wc[i].status != IBV_WC_SUCCESS)
+            {
+                fprintf(stderr, "CQE[%d] 异常, status=%d, wr_id=%llu\n",
+                        i, wc[i].status, (unsigned long long)wc[i].wr_id);
+                ibv_dereg_mr(mr);
+                free(buf);
+                ibv_destroy_qp(qp);
+                ibv_destroy_cq(cq);
+                ibv_dealloc_pd(pd);
+                ibv_close_device(ctx);
+                ibv_free_device_list(dev_list);
+                return 1;
+            }
+        }
+    }
+
+    printf("Loopback 的 CQ 完成事件数量: %d\n", completed);
+    printf("接收缓冲区内容: %s\n", recv_buf);
+
+    // 完成后先注销 MR，再释放用户态 buffer。
+    ibv_dereg_mr(mr);
+    free(buf);
 
     // 记得打扫战场
     ibv_destroy_qp(qp);
