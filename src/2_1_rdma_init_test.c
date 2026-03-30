@@ -248,7 +248,9 @@ int main()
     printf("QP 状态已切换到 RTS（Loopback 配置）\n");
 
     // 6. 准备一块用户态内存并注册为 MR（Memory Region）
-    // RDMA 硬件只认识“注册过”的内存地址；未注册地址不能直接 DMA。
+    // RDMA 网卡不会直接信任任意虚拟地址。
+    // 只有先把内存注册成 MR，网卡才会记录这段地址的访问权限和地址翻译信息，
+    // 后续 SGE 里带上 lkey 后，硬件才能安全地 DMA 读/写这块内存。
     buf = calloc(1, buf_size);
     if (!buf)
     {
@@ -256,6 +258,8 @@ int main()
     }
 
     // 一个 MR 里切两段：前半段当发送缓冲区，后半段当接收缓冲区。
+    // 这么做的目的：示例简单、内存连续、只需要注册一次 MR。
+    // 发送和接收都在同一块注册内存里，便于观察 loopback 前后数据变化。
     send_buf = buf;
     recv_buf = buf + 2048;
     if (msg_len > 2048)
@@ -264,7 +268,9 @@ int main()
     }
     memcpy(send_buf, msg, msg_len);
 
-    // 注册 MR，拿到 lkey/rkey。post_send/post_recv 时 SGE 要带 lkey。
+    // 注册 MR，拿到 lkey/rkey。
+    // - lkey: 本地网卡访问这块内存时用于校验权限（本例 post_send/post_recv 必须用）。
+    // - rkey: 远端执行 RDMA Read/Write 访问这块内存时使用（本例 loopback SEND 不直接用到）。
     mr = ibv_reg_mr(pd, buf, buf_size,
                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
     if (!mr)
@@ -273,16 +279,17 @@ int main()
     }
 
     // 7. 先 post 一个接收 WR 到 RQ（非常关键）
-    // RC 模式下如果对端先发而你还没挂 recv，可能触发 RNR 重试。
+    // RC 模式下如果对端先发而你还没挂 recv，接收队列没“空位”就会触发 RNR（Receiver Not Ready）。
+    // 所以最佳实践是：先挂 recv，再发 send。
     memset(&recv_sge, 0, sizeof(recv_sge));
-    recv_sge.addr = (uintptr_t)recv_buf;
-    recv_sge.length = msg_len;
-    recv_sge.lkey = mr->lkey;
+    recv_sge.addr = (uintptr_t)recv_buf; // addr: 目标数据缓冲区起始地址
+    recv_sge.length = msg_len;           // length: 允许写入的最大字节数
+    recv_sge.lkey = mr->lkey;            // lkey: 告诉网卡这段地址属于哪个已注册 MR
 
     memset(&recv_wr, 0, sizeof(recv_wr));
-    recv_wr.wr_id = 1; // 完成队列里用于区分这条 WR 的用户自定义 ID
-    recv_wr.sg_list = &recv_sge;
-    recv_wr.num_sge = 1;
+    recv_wr.wr_id = 1;           // wr_id: 用户自定义标签，CQE 返回时可据此识别“这是哪条请求”
+    recv_wr.sg_list = &recv_sge; // sg_list: 指向一个或多个数据片段描述符（SGE）
+    recv_wr.num_sge = 1;         // num_sge: 本 WR 使用 1 个片段，覆盖 recv_buf 这一段
 
     if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr))
     {
@@ -290,17 +297,19 @@ int main()
     }
 
     // 8. 再 post 一个 SEND WR 到 SQ，发往“自己”
+    // Loopback 场景中，发送路径和接收路径都在本机闭环，
+    // 但流程和真实双机场景一致：SQ 发，RQ 收，CQ 回报完成。
     memset(&send_sge, 0, sizeof(send_sge));
-    send_sge.addr = (uintptr_t)send_buf;
-    send_sge.length = msg_len;
-    send_sge.lkey = mr->lkey;
+    send_sge.addr = (uintptr_t)send_buf; // 从 send_buf 这段内存读取待发送数据
+    send_sge.length = msg_len;           // 发送字节数
+    send_sge.lkey = mr->lkey;            // 对发送源地址做本地访问校验
 
     memset(&send_wr, 0, sizeof(send_wr));
-    send_wr.wr_id = 2; // 发送 WR 的 ID
-    send_wr.sg_list = &send_sge;
-    send_wr.num_sge = 1;
-    send_wr.opcode = IBV_WR_SEND;
-    send_wr.send_flags = IBV_SEND_SIGNALED; // 要求硬件把这次 SEND 完成写入 CQ
+    send_wr.wr_id = 2;                      // 发送 WR 的标签，和 recv_wr.wr_id 用不同值便于区分
+    send_wr.sg_list = &send_sge;            // 指向发送数据片段描述
+    send_wr.num_sge = 1;                    // 单片段发送
+    send_wr.opcode = IBV_WR_SEND;           // 普通 SEND：把数据投递到对端 RQ（不是 RDMA Write）
+    send_wr.send_flags = IBV_SEND_SIGNALED; // 产生 SEND CQE；教学场景建议每次都信号化，便于观察
 
     if (ibv_post_send(qp, &send_wr, &bad_send_wr))
     {
@@ -308,19 +317,22 @@ int main()
     }
 
     // 9. 轮询 CQ，等待 2 个完成事件（一个 RECV，一个 SEND）
-    // 这是最直观的教学写法：忙轮询。实际工程可用事件通知优化 CPU 占用。
+    // ibv_poll_cq 的返回值 n 表示“这次取到了几个 CQE”。
+    // 这里目标是收齐 2 个 CQE，证明收发两条 WR 都已完成。
+    // 这是最直观的教学写法：忙轮询。实际工程可用事件通知降低 CPU 占用。
     while (completed < 2)
     {
         int n;
         int i;
 
+        // 从 CQ 中最多取 (2 - completed) 个事件，直接追加写入 wc[] 的未用区域。
         n = ibv_poll_cq(cq, 2 - completed, &wc[completed]);
         if (n < 0)
         {
             FAIL_AND_RETURN("ibv_poll_cq 调用失败");
         }
 
-        completed += n;
+        completed += n; // 累加当前已完成的 CQE 数量
         poll_round++;
         if (poll_round > 1000000)
         {
@@ -330,6 +342,8 @@ int main()
 
         for (i = 0; i < completed; i++)
         {
+            // 每个 CQE 都必须检查 status。
+            // IBV_WC_SUCCESS 表示该 WR 被硬件成功执行。
             if (wc[i].status != IBV_WC_SUCCESS)
             {
                 fprintf(stderr, "CQE[%d] 异常, status=%d, wr_id=%llu\n",
